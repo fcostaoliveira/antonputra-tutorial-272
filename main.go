@@ -76,7 +76,7 @@ type User struct {
 const text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui kjdhf 13ye jasd sdhhu2edlka officia deserunt mollit anim id est laborum."
 
 // worker runs a Redis client that performs operations at the target rate
-func worker(clientID int, addr, password string, targetRate int, pause int, m *mon.Metrics, wg *sync.WaitGroup, totalOps *atomic.Int64, latencyTracker *LatencyTracker) {
+func worker(clientID int, addr, password string, targetRate int, pause int, poolSize int, m *mon.Metrics, wg *sync.WaitGroup, totalOps *atomic.Int64, latencyTracker *LatencyTracker) {
 	defer wg.Done()
 
 	// Create Redis client for this worker.
@@ -87,7 +87,7 @@ func worker(clientID int, addr, password string, targetRate int, pause int, m *m
 		MaintNotificationsConfig: &maintnotifications.Config{
 			Mode: maintnotifications.ModeDisabled,
 		},
-		PoolSize: 1,
+		PoolSize: poolSize,
 	})
 	defer rdb.Close()
 
@@ -159,8 +159,10 @@ func worker(clientID int, addr, password string, targetRate int, pause int, m *m
 
 		duration := time.Duration(delta)
 
-		// Record the operation duration using a Prometheus histogram.
-		m.Hist.WithLabelValues("redis").Observe(duration.Seconds())
+		// Record the operation duration using a Prometheus histogram (if enabled).
+		if m != nil {
+			m.Hist.WithLabelValues("redis").Observe(duration.Seconds())
+		}
 
 		// Track latency for p90 calculation
 		latencyTracker.Add(duration)
@@ -183,6 +185,8 @@ func main() {
 	initialRate := flag.Int("initial-rate", 1000, "Initial number of requests per second per client")
 	rateIncrease := flag.Int("rate-increase", 1000, "Rate increase per second (ops/sec per second)")
 	pause := flag.Int("pause", 0, "Delays between requests in microseconds")
+	poolSize := flag.Int("pool-size", 1, "Number of connections per Redis client")
+	enableMetrics := flag.Bool("enable-metrics", false, "Enable Prometheus metrics on port 8082")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 
 	// Parse the flags.
@@ -204,10 +208,14 @@ func main() {
 
 	fmt.Printf("# Connecting to %s, initial rate per client: %d, rate increase: %d ops/sec per second, pause: %d\n", *addr, *initialRate, *rateIncrease, *pause)
 
-	// Create Prometheus metrics.
-	reg := prometheus.NewRegistry()
-	m := mon.NewMetrics("client", []string{"version"}, []string{}, []string{"target"}, reg)
-	mon.StartPrometheus(8082, reg)
+	// Create Prometheus metrics if enabled.
+	var m *mon.Metrics
+	if *enableMetrics {
+		reg := prometheus.NewRegistry()
+		m = mon.NewMetrics("client", []string{"version"}, []string{}, []string{"target"}, reg)
+		mon.StartPrometheus(8082, reg)
+		fmt.Println("# Prometheus metrics enabled on :8082")
+	}
 
 	// Print CSV header
 	fmt.Println("second,active_clients,expected_rate_ops_sec,actual_ops_sec,total_ops,p90_latency_ms")
@@ -235,8 +243,8 @@ func main() {
 	// Spawn the first client immediately.
 	clientID++
 	wg.Add(1)
-	go worker(clientID, *addr, *password, *initialRate, *pause, m, &wg, &totalOps, latencyTracker)
-	fmt.Printf("# Client %d started with target rate: %d ops/sec\n", clientID, *initialRate)
+	go worker(clientID, *addr, *password, *initialRate, *pause, *poolSize, m, &wg, &totalOps, latencyTracker)
+	fmt.Printf("# Client %d started with target rate: %d ops/sec, pool size: %d\n", clientID, *initialRate, *poolSize)
 
 	// Monitor and spawn new clients every second.
 	go func() {
@@ -253,7 +261,7 @@ func main() {
 			// Spawn a new client.
 			clientID++
 			wg.Add(1)
-			go worker(clientID, *addr, *password, *initialRate, *pause, m, &wg, &totalOps, latencyTracker)
+			go worker(clientID, *addr, *password, *initialRate, *pause, *poolSize, m, &wg, &totalOps, latencyTracker)
 
 			expectedRate := *initialRate + (secondsElapsed * *rateIncrease)
 			// Print CSV format: second,active_clients,expected_rate_ops_sec,actual_ops_sec,total_ops,p90_latency_ms
