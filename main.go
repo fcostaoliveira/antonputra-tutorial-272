@@ -144,14 +144,16 @@ func worker(ctx context.Context, clientID int, addr, password string, targetRate
 		}
 		startSetGet := time.Now().UnixNano()
 		// Set the Redis key (UUID) to the timestamp value.
-		err = rdb.Set(ctx, key.String(), value, expr).Err()
+		// Use background context for Redis operations (not the test duration context)
+		redisCtx := context.Background()
+		err = rdb.Set(redisCtx, key.String(), value, expr).Err()
 		if err != nil {
 			util.Warn(err, "rdb.Set failed")
 			continue
 		}
 
 		// Fetch the timestamp by the UUID key.
-		val, err := rdb.Get(ctx, key.String()).Result()
+		val, err := rdb.Get(redisCtx, key.String()).Result()
 		endSetGet := time.Now().UnixNano()
 		// Calculate the elapsed time between setting and retrieving the value in Redis.
 		delta := endSetGet - startSetGet
