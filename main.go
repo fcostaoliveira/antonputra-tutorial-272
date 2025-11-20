@@ -193,6 +193,7 @@ func main() {
 	pause := flag.Int("pause", 0, "Delays between requests in microseconds")
 	poolSize := flag.Int("pool-size", 1, "Number of connections per Redis client")
 	duration := flag.Int("duration", 1200, "Test duration in seconds")
+	tickInterval := flag.Float64("tick-interval", 1.0, "Interval in seconds between spawning new clients and reporting (0.1, 1, or 10)")
 	enableMetrics := flag.Bool("enable-metrics", false, "Enable Prometheus metrics on port 8082")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 
@@ -214,7 +215,7 @@ func main() {
 	}
 
 	fmt.Printf("# Connecting to %s, initial rate per client: %d, rate increase: %d ops/sec per second, pause: %d\n", *addr, *initialRate, *rateIncrease, *pause)
-	fmt.Printf("# Test duration: %d seconds\n", *duration)
+	fmt.Printf("# Test duration: %d seconds, tick interval: %.1f seconds\n", *duration, *tickInterval)
 
 	// Create Prometheus metrics if enabled.
 	var m *mon.Metrics
@@ -226,7 +227,7 @@ func main() {
 	}
 
 	// Print CSV header
-	fmt.Println("second,active_clients,expected_rate_ops_sec,actual_ops_sec,total_ops,p90_latency_ms")
+	fmt.Println("elapsed_time_sec,active_clients,expected_rate_ops_sec,actual_ops_sec,total_ops,p90_latency_ms")
 
 	// Create a context with timeout for the test duration.
 	testCtx, cancel := context.WithTimeout(context.Background(), time.Duration(*duration)*time.Second)
@@ -246,8 +247,9 @@ func main() {
 	// Track the overall start time.
 	overallStart := time.Now()
 
-	// Ticker to spawn a new client every second.
-	ticker := time.NewTicker(1 * time.Second)
+	// Ticker to spawn a new client at the specified interval.
+	tickDuration := time.Duration(*tickInterval * float64(time.Second))
+	ticker := time.NewTicker(tickDuration)
 	defer ticker.Stop()
 
 	clientID := 0
@@ -258,19 +260,27 @@ func main() {
 	go worker(testCtx, clientID, *addr, *password, *initialRate, *pause, *poolSize, m, &wg, &totalOps, latencyTracker)
 	fmt.Printf("# Client %d started with target rate: %d ops/sec, pool size: %d\n", clientID, *initialRate, *poolSize)
 
-	// Monitor and spawn new clients every second.
+	// Monitor and spawn new clients at the specified tick interval.
 	go func() {
 		lastOps := int64(0)
+		lastTime := overallStart
 		for {
 			select {
 			case <-testCtx.Done():
 				// Test duration reached, stop spawning new clients
 				return
 			case <-ticker.C:
-				secondsElapsed := int(time.Since(overallStart).Seconds())
+				now := time.Now()
+				secondsElapsed := now.Sub(overallStart).Seconds()
+				intervalDuration := now.Sub(lastTime).Seconds()
+				lastTime = now
+
 				currentTotalOps := totalOps.Load()
-				opsThisSecond := currentTotalOps - lastOps
+				opsThisInterval := currentTotalOps - lastOps
 				lastOps = currentTotalOps
+
+				// Calculate ops/sec based on actual interval duration
+				opsPerSec := int64(float64(opsThisInterval) / intervalDuration)
 
 				// Get p90 latency and reset for next interval
 				p90Latency := latencyTracker.GetAndResetP90()
@@ -280,10 +290,10 @@ func main() {
 				wg.Add(1)
 				go worker(testCtx, clientID, *addr, *password, *initialRate, *pause, *poolSize, m, &wg, &totalOps, latencyTracker)
 
-				expectedRate := *initialRate + (secondsElapsed * *rateIncrease)
-				// Print CSV format: second,active_clients,expected_rate_ops_sec,actual_ops_sec,total_ops,p90_latency_ms
-				fmt.Printf("%d,%d,%d,%d,%d,%.2f\n",
-					secondsElapsed, clientID, expectedRate, opsThisSecond, currentTotalOps, p90Latency)
+				expectedRate := *initialRate + (int(secondsElapsed) * *rateIncrease)
+				// Print CSV format: elapsed_time,active_clients,expected_rate_ops_sec,actual_ops_sec,total_ops,p90_latency_ms
+				fmt.Printf("%.1f,%d,%d,%d,%d,%.2f\n",
+					secondsElapsed, clientID, expectedRate, opsPerSec, currentTotalOps, p90Latency)
 			}
 		}
 	}()
