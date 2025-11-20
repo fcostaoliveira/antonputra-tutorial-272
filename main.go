@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
+	"os"
+	"runtime/pprof"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -84,6 +87,7 @@ func worker(clientID int, addr, password string, targetRate int, pause int, m *m
 		MaintNotificationsConfig: &maintnotifications.Config{
 			Mode: maintnotifications.ModeDisabled,
 		},
+		PoolSize: 1,
 	})
 	defer rdb.Close()
 
@@ -132,7 +136,7 @@ func worker(clientID int, addr, password string, targetRate int, pause int, m *m
 			util.Warn(err, "rdb.Set failed")
 			continue
 		}
-
+		startSetGet := time.Now().UnixNano()
 		// Set the Redis key (UUID) to the timestamp value.
 		err = rdb.Set(ctx, key.String(), value, expr).Err()
 		if err != nil {
@@ -142,17 +146,17 @@ func worker(clientID int, addr, password string, targetRate int, pause int, m *m
 
 		// Fetch the timestamp by the UUID key.
 		val, err := rdb.Get(ctx, key.String()).Result()
+		endSetGet := time.Now().UnixNano()
+		// Calculate the elapsed time between setting and retrieving the value in Redis.
+		delta := endSetGet - startSetGet
 		if err != nil {
 			util.Warn(err, "rdb.Get failed")
 			continue
 		}
-
 		// Load the user from Redis
 		var loaded User
 		json.Unmarshal([]byte(val), &loaded)
 
-		// Calculate the elapsed time between setting and retrieving the value in Redis.
-		delta := time.Now().UnixNano() - loaded.Timestamp
 		duration := time.Duration(delta)
 
 		// Record the operation duration using a Prometheus histogram.
@@ -166,7 +170,9 @@ func worker(clientID int, addr, password string, targetRate int, pause int, m *m
 		totalOps.Add(1)
 
 		// Pause execution to prevent overloading the target.
-		util.Sleep(pause)
+		if pause > 0 {
+			util.Sleep(pause)
+		}
 	}
 }
 
@@ -176,10 +182,26 @@ func main() {
 	password := flag.String("password", "", "Redis password")
 	initialRate := flag.Int("initial-rate", 1000, "Initial number of requests per second per client")
 	rateIncrease := flag.Int("rate-increase", 1000, "Rate increase per second (ops/sec per second)")
-	pause := flag.Int("pause", 100, "Delays between requests in microseconds")
+	pause := flag.Int("pause", 0, "Delays between requests in microseconds")
+	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 
 	// Parse the flags.
 	flag.Parse()
+
+	// Start CPU profiling if requested
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal("Could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("Could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+		fmt.Printf("# CPU profiling enabled, writing to %s\n", *cpuprofile)
+	}
+
 	fmt.Printf("# Connecting to %s, initial rate per client: %d, rate increase: %d ops/sec per second, pause: %d\n", *addr, *initialRate, *rateIncrease, *pause)
 
 	// Create Prometheus metrics.
